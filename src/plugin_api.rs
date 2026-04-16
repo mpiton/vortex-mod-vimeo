@@ -11,7 +11,7 @@ use crate::url_matcher::extract_video_id;
 use crate::{
     build_media_variants_response, build_single_video_response, ensure_single_video,
     filter_audio_only, handle_can_handle, handle_supports_playlist, pick_variant_for_quality,
-    MediaVariant, MediaVariantsResponse,
+    MediaVariant, MediaVariantsResponse, VariantKind,
 };
 
 #[host_fn]
@@ -101,8 +101,9 @@ pub fn resolve_stream_url(input: String) -> FnResult<String> {
     let config = fetch_player_config(&video_id)?;
     let variants = build_media_variants_response(config);
 
-    // Audio-only mode: quality is not applicable to audio variants,
-    // so select the first available audio variant directly.
+    // Audio-only mode: returns dedicated audio variants when present, or the
+    // adaptive HLS stream when no dedicated audio variant exists (filter_audio_only
+    // retains Adaptive entries for downstream demuxing).
     if params.audio_only {
         let cdn_url = filter_audio_only(variants)
             .variants
@@ -113,16 +114,37 @@ pub fn resolve_stream_url(input: String) -> FnResult<String> {
         return Ok(cdn_url);
     }
 
-    // Hoist the quality-matched variant to the front so the first URL
-    // is always the best progressive match for the requested quality.
-    let cdn_url = if !params.quality.is_empty() {
+    // Prefer the highest progressive MP4; only fall back to adaptive HLS when
+    // no progressive variant exists. Variants are sorted Audio → Video (asc
+    // height) → Adaptive, so iterating in reverse finds the best Video first.
+    let progressive_fallback = variants
+        .variants
+        .iter()
+        .rev()
+        .find(|v| matches!(v.kind, VariantKind::Video));
+    let adaptive_fallback = variants
+        .variants
+        .iter()
+        .find(|v| matches!(v.kind, VariantKind::Adaptive));
+
+    let selected = if !params.quality.is_empty() {
         pick_variant_for_quality(&variants.variants, &params.quality)
-            .map(|v| v.url.clone())
-            .or_else(|| variants.variants.last().map(|v| v.url.clone()))
+            .and_then(|v| {
+                if matches!(v.kind, VariantKind::Video) {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .or(progressive_fallback)
+            .or(adaptive_fallback)
     } else {
-        variants.variants.last().map(|v| v.url.clone())
-    }
-    .ok_or_else(|| error_to_fn_error(PluginError::NoVariantsFound))?;
+        progressive_fallback.or(adaptive_fallback)
+    };
+
+    let cdn_url = selected
+        .map(|v| v.url.clone())
+        .ok_or_else(|| error_to_fn_error(PluginError::NoVariantsFound))?;
 
     Ok(cdn_url)
 }
