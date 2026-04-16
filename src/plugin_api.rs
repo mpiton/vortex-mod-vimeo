@@ -11,7 +11,6 @@ use crate::url_matcher::extract_video_id;
 use crate::{
     build_media_variants_response, build_single_video_response, ensure_single_video,
     filter_audio_only, handle_can_handle, handle_supports_playlist, pick_variant_for_quality,
-    MediaVariant, MediaVariantsResponse,
 };
 
 #[host_fn]
@@ -66,6 +65,58 @@ pub fn get_media_variants(url: String) -> FnResult<String> {
     // respect for the configured preference.
     let reordered = apply_quality_preference(filtered);
     Ok(serde_json::to_string(&reordered)?)
+}
+
+/// Resolve a direct CDN stream URL for a single video.
+///
+/// Input JSON: `{ "url", "quality"?, "format"?, "audio_only"? }`.
+/// Returns the raw CDN URL string so the host can pass it directly to the
+/// download engine. For progressive variants this is an MP4 CDN link; for
+/// the adaptive stream it is an HLS m3u8 manifest URL.
+///
+/// `quality` is matched against progressive variant heights (e.g. `"720p"`).
+/// When no progressive variant matches, the HLS adaptive stream is returned.
+/// `format` and `audio_only` are accepted for API parity with other plugins
+/// but are not used: Vimeo exposes only one format per quality level, and
+/// audio-only extraction via the adaptive stream is handled downstream.
+#[plugin_fn]
+pub fn resolve_stream_url(input: String) -> FnResult<String> {
+    #[derive(serde::Deserialize)]
+    struct Input {
+        url: String,
+        #[serde(default)]
+        quality: String,
+        #[serde(default)]
+        audio_only: bool,
+    }
+
+    let params: Input =
+        serde_json::from_str(&input).map_err(|e| error_to_fn_error(PluginError::SerdeJson(e)))?;
+
+    ensure_single_video(&params.url).map_err(error_to_fn_error)?;
+
+    let video_id = extract_video_id(&params.url)
+        .ok_or_else(|| error_to_fn_error(PluginError::UnsupportedUrl(params.url.clone())))?;
+
+    let config = fetch_player_config(&video_id)?;
+    let mut variants = build_media_variants_response(config);
+
+    if params.audio_only {
+        variants = filter_audio_only(variants);
+    }
+
+    // Hoist the quality-matched variant to the front so the first URL
+    // is always the best progressive match for the requested quality.
+    let cdn_url = if !params.quality.is_empty() {
+        pick_variant_for_quality(&variants.variants, &params.quality)
+            .map(|v| v.url.clone())
+            .or_else(|| variants.variants.first().map(|v| v.url.clone()))
+    } else {
+        variants.variants.last().map(|v| v.url.clone())
+    }
+    .ok_or_else(|| error_to_fn_error(PluginError::NoVariantsFound))?;
+
+    Ok(cdn_url)
 }
 
 #[plugin_fn]
