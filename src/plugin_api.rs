@@ -11,6 +11,7 @@ use crate::url_matcher::extract_video_id;
 use crate::{
     build_media_variants_response, build_single_video_response, ensure_single_video,
     filter_audio_only, handle_can_handle, handle_supports_playlist, pick_variant_for_quality,
+    MediaVariant, MediaVariantsResponse,
 };
 
 #[host_fn]
