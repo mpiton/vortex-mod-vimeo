@@ -76,9 +76,8 @@ pub fn get_media_variants(url: String) -> FnResult<String> {
 ///
 /// `quality` is matched against progressive variant heights (e.g. `"720p"`).
 /// When no progressive variant matches, the HLS adaptive stream is returned.
-/// `format` and `audio_only` are accepted for API parity with other plugins
-/// but are not used: Vimeo exposes only one format per quality level, and
-/// audio-only extraction via the adaptive stream is handled downstream.
+/// `audio_only` filters to audio-only variants when set. `format` is not
+/// currently supported as Vimeo exposes only one format per quality level.
 #[plugin_fn]
 pub fn resolve_stream_url(input: String) -> FnResult<String> {
     #[derive(serde::Deserialize)]
@@ -99,10 +98,18 @@ pub fn resolve_stream_url(input: String) -> FnResult<String> {
         .ok_or_else(|| error_to_fn_error(PluginError::UnsupportedUrl(params.url.clone())))?;
 
     let config = fetch_player_config(&video_id)?;
-    let mut variants = build_media_variants_response(config);
+    let variants = build_media_variants_response(config);
 
+    // Audio-only mode: quality is not applicable to audio variants,
+    // so select the first available audio variant directly.
     if params.audio_only {
-        variants = filter_audio_only(variants);
+        let cdn_url = filter_audio_only(variants)
+            .variants
+            .into_iter()
+            .next()
+            .map(|v| v.url)
+            .ok_or_else(|| error_to_fn_error(PluginError::NoVariantsFound))?;
+        return Ok(cdn_url);
     }
 
     // Hoist the quality-matched variant to the front so the first URL
@@ -110,7 +117,7 @@ pub fn resolve_stream_url(input: String) -> FnResult<String> {
     let cdn_url = if !params.quality.is_empty() {
         pick_variant_for_quality(&variants.variants, &params.quality)
             .map(|v| v.url.clone())
-            .or_else(|| variants.variants.first().map(|v| v.url.clone()))
+            .or_else(|| variants.variants.last().map(|v| v.url.clone()))
     } else {
         variants.variants.last().map(|v| v.url.clone())
     }
