@@ -11,7 +11,7 @@ use crate::url_matcher::extract_video_id;
 use crate::{
     build_media_variants_response, build_single_video_response, ensure_single_video,
     filter_audio_only, handle_can_handle, handle_supports_playlist, pick_variant_for_quality,
-    MediaVariant, MediaVariantsResponse,
+    MediaVariant, MediaVariantsResponse, VariantKind,
 };
 
 #[host_fn]
@@ -66,6 +66,87 @@ pub fn get_media_variants(url: String) -> FnResult<String> {
     // respect for the configured preference.
     let reordered = apply_quality_preference(filtered);
     Ok(serde_json::to_string(&reordered)?)
+}
+
+/// Resolve a direct CDN stream URL for a single video.
+///
+/// Input JSON: `{ "url", "quality"?, "format"?, "audio_only"? }`.
+/// Returns the raw CDN URL string so the host can pass it directly to the
+/// download engine. For progressive variants this is an MP4 CDN link; for
+/// the adaptive stream it is an HLS m3u8 manifest URL.
+///
+/// `quality` is matched against progressive variant heights (e.g. `"720p"`).
+/// When no progressive variant matches, the HLS adaptive stream is returned.
+/// `audio_only` filters to audio-only variants when set. `format` is not
+/// currently supported as Vimeo exposes only one format per quality level.
+#[plugin_fn]
+pub fn resolve_stream_url(input: String) -> FnResult<String> {
+    #[derive(serde::Deserialize)]
+    struct Input {
+        url: String,
+        #[serde(default)]
+        quality: String,
+        #[serde(default)]
+        audio_only: bool,
+    }
+
+    let params: Input =
+        serde_json::from_str(&input).map_err(|e| error_to_fn_error(PluginError::SerdeJson(e)))?;
+
+    ensure_single_video(&params.url).map_err(error_to_fn_error)?;
+
+    let video_id = extract_video_id(&params.url)
+        .ok_or_else(|| error_to_fn_error(PluginError::UnsupportedUrl(params.url.clone())))?;
+
+    let config = fetch_player_config(&video_id)?;
+    let variants = build_media_variants_response(config);
+
+    // Audio-only mode: returns dedicated audio variants when present, or the
+    // adaptive HLS stream when no dedicated audio variant exists (filter_audio_only
+    // retains Adaptive entries for downstream demuxing).
+    if params.audio_only {
+        let cdn_url = filter_audio_only(variants)
+            .variants
+            .into_iter()
+            .next()
+            .map(|v| v.url)
+            .ok_or_else(|| error_to_fn_error(PluginError::NoVariantsFound))?;
+        return Ok(cdn_url);
+    }
+
+    // Prefer the highest progressive MP4; only fall back to adaptive HLS when
+    // no progressive variant exists. Variants are sorted Audio → Video (asc
+    // height) → Adaptive, so iterating in reverse finds the best Video first.
+    let progressive_fallback = variants
+        .variants
+        .iter()
+        .rev()
+        .find(|v| matches!(v.kind, VariantKind::Video));
+    let adaptive_fallback = variants
+        .variants
+        .iter()
+        .find(|v| matches!(v.kind, VariantKind::Adaptive));
+
+    let selected = if !params.quality.is_empty() {
+        pick_variant_for_quality(&variants.variants, &params.quality)
+            .and_then(|v| {
+                if matches!(v.kind, VariantKind::Video) {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .or(progressive_fallback)
+            .or(adaptive_fallback)
+    } else {
+        progressive_fallback.or(adaptive_fallback)
+    };
+
+    let cdn_url = selected
+        .map(|v| v.url.clone())
+        .ok_or_else(|| error_to_fn_error(PluginError::NoVariantsFound))?;
+
+    Ok(cdn_url)
 }
 
 #[plugin_fn]

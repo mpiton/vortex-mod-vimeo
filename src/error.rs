@@ -32,4 +32,8 @@ pub enum PluginError {
     /// Vimeo video is private or requires authentication.
     #[error("Vimeo resource is private: {0}")]
     Private(String),
+
+    /// Player config contained no usable variants.
+    #[error("no playable variants found for this Vimeo video")]
+    NoVariantsFound,
 }
