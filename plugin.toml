@@ -1,6 +1,6 @@
 [plugin]
 name = "vortex-mod-vimeo"
-version = "1.0.0"
+version = "1.1.1"
 category = "crawler"
 author = "vortex-community"
 description = "Vimeo public/private videos with quality selection"
