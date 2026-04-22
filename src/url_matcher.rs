@@ -176,8 +176,12 @@ pub fn extract_private_hash(url: &str) -> Option<String> {
 /// the same `[a-f0-9]{8,}` shape enforced by `private_video_regex` so
 /// arbitrary query junk can't spoof a share token.
 fn extract_h_query_param(path_and_query: &str) -> Option<String> {
-    let query = path_and_query.split_once('?')?.1;
-    let query = query.split('#').next().unwrap_or("");
+    // Fragment comes *before* any query in URL grammar, so a `?` that
+    // shows up after a `#` is part of the fragment and must not be
+    // treated as the query delimiter. Strip the fragment first, then
+    // look for `?`.
+    let without_fragment = path_and_query.split('#').next().unwrap_or("");
+    let query = without_fragment.split_once('?')?.1;
     for pair in query.split('&') {
         if let Some(value) = pair.strip_prefix("h=") {
             if value.len() >= 8 && value.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -347,6 +351,28 @@ mod tests {
     #[test]
     fn extract_private_hash_from_player_query_rejects_too_short() {
         assert!(extract_private_hash("https://player.vimeo.com/video/123456789?h=abc").is_none());
+    }
+
+    #[test]
+    fn extract_private_hash_from_player_query_ignores_fragment() {
+        // `?` inside a fragment must not be mistaken for the query
+        // delimiter — the fragment (`#`) comes first in URL grammar.
+        // This URL has no real query, only a fragment that happens to
+        // contain `?h=…`; the hash in the fragment must not be accepted.
+        assert!(
+            extract_private_hash("https://player.vimeo.com/video/123456789#?h=deadbeefcafe")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_from_player_query_with_trailing_fragment() {
+        // Real query followed by a fragment — hash extraction must still
+        // pick the query's value, not the fragment's.
+        assert_eq!(
+            extract_private_hash("https://player.vimeo.com/video/123456789?h=fba859c46b#t=30"),
+            Some("fba859c46b".into())
+        );
     }
 
     #[test]
