@@ -156,6 +156,14 @@ pub fn extract_video_id(url: &str) -> Option<String> {
 ///   would silently drop the token and fail on restricted embeds.
 pub fn extract_private_hash(url: &str) -> Option<String> {
     let (host, path) = validate_and_split(url)?;
+    // Gate on the Vimeo host set up front: the path-segment regex
+    // `/<id>/<hash>` is generic enough to match on any host, so
+    // without this check a URL like `evil.example.com/123/abcdef…`
+    // would produce a non-`None` result even though it has nothing
+    // to do with Vimeo.
+    if !is_vimeo_host(&host) {
+        return None;
+    }
 
     let path_only = normalize_path(path);
     if let Some(hash) = private_video_regex()
@@ -403,6 +411,20 @@ mod tests {
         assert_eq!(
             extract_private_hash("https://player.vimeo.com/video/123456789?h=fba859c46b#t=30"),
             Some("fba859c46b".into())
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_ignores_non_vimeo_host() {
+        // The path-segment regex `/<id>/<hash>` is generic enough to
+        // match on any host — gate on is_vimeo_host up front so an
+        // impostor URL can't spoof a Vimeo share token shape.
+        assert!(
+            extract_private_hash("https://evil.example.com/123456789/abcdef1234").is_none(),
+            "non-Vimeo hosts must not return a hash even with a matching path shape"
+        );
+        assert!(
+            extract_private_hash("https://player.example.com/123456789/abcdef1234").is_none()
         );
     }
 
