@@ -18,6 +18,10 @@ use crate::{
 extern "ExtismHost" {
     fn http_request(req: String) -> String;
     fn get_config(key: String) -> String;
+    /// JSON in → JSON out — see `yt_dlp::SubprocessRequest` /
+    /// `yt_dlp::SubprocessResponse`. Used by `download_to_file` for
+    /// the HLS/DASH adaptive fallback.
+    fn run_subprocess(req: String) -> String;
 }
 
 #[plugin_fn]
@@ -116,18 +120,21 @@ pub fn resolve_stream_url(input: String) -> FnResult<String> {
         return Ok(cdn_url);
     }
 
-    // Prefer the highest progressive MP4; only fall back to adaptive HLS when
-    // no progressive variant exists. Variants are sorted Audio → Video (asc
-    // height) → Adaptive, so iterating in reverse finds the best Video first.
+    // Prefer the highest progressive MP4; signal `AdaptiveStreamOnly`
+    // when the only remaining option is HLS/DASH so the host falls
+    // back to `download_to_file` (yt-dlp + ffmpeg merge). Returning
+    // the `.m3u8` URL directly would make the generic download engine
+    // save the playlist text file as if it were the video — what the
+    // user hit before this change.
     let progressive_fallback = variants
         .variants
         .iter()
         .rev()
         .find(|v| matches!(v.kind, VariantKind::Video));
-    let adaptive_fallback = variants
+    let has_adaptive = variants
         .variants
         .iter()
-        .find(|v| matches!(v.kind, VariantKind::Adaptive));
+        .any(|v| matches!(v.kind, VariantKind::Adaptive));
 
     let selected = if !params.quality.is_empty() {
         pick_variant_for_quality(&variants.variants, &params.quality)
@@ -139,16 +146,69 @@ pub fn resolve_stream_url(input: String) -> FnResult<String> {
                 }
             })
             .or(progressive_fallback)
-            .or(adaptive_fallback)
     } else {
-        progressive_fallback.or(adaptive_fallback)
+        progressive_fallback
     };
 
-    let cdn_url = selected
-        .map(|v| v.url.clone())
-        .ok_or_else(|| error_to_fn_error(PluginError::NoVariantsFound))?;
+    match selected {
+        Some(v) => Ok(v.url.clone()),
+        None if has_adaptive => Err(error_to_fn_error(PluginError::AdaptiveStreamOnly)),
+        None => Err(error_to_fn_error(PluginError::NoVariantsFound)),
+    }
+}
 
-    Ok(cdn_url)
+/// Download a Vimeo video via yt-dlp when `resolve_stream_url` returned
+/// `AdaptiveStreamOnly`. yt-dlp pulls the HLS/DASH manifests, downloads
+/// the segment streams, and merges them with ffmpeg into a single file
+/// at `output_dir/<id>.<ext>`. The merged path is returned as a raw
+/// string.
+///
+/// Input: JSON `{ "url", "quality"?, "format"?, "output_dir", "audio_only"? }`
+/// Output: absolute path of the merged file.
+#[plugin_fn]
+pub fn download_to_file(input: String) -> FnResult<String> {
+    #[derive(serde::Deserialize)]
+    struct Input {
+        url: String,
+        #[serde(default)]
+        quality: String,
+        #[serde(default)]
+        format: String,
+        output_dir: String,
+        #[serde(default)]
+        audio_only: bool,
+    }
+
+    let params: Input =
+        serde_json::from_str(&input).map_err(|e| error_to_fn_error(PluginError::SerdeJson(e)))?;
+
+    ensure_single_video(&params.url).map_err(error_to_fn_error)?;
+
+    let args = crate::yt_dlp::yt_dlp_args_for_download_to_file(
+        &params.url,
+        &params.quality,
+        &params.format,
+        &params.output_dir,
+        params.audio_only,
+    );
+    let req_json = crate::yt_dlp::build_download_request(args).map_err(error_to_fn_error)?;
+
+    // SAFETY: `run_subprocess` is resolved by the Vortex plugin host
+    // at load time (see src-tauri/src/adapters/driven/plugin/
+    // host_functions.rs: `make_run_subprocess_function`). Invariants:
+    //   1. The host registers the symbol in the `ExtismHost`
+    //      namespace before any `#[plugin_fn]` export is callable.
+    //   2. The ABI is `(I64) -> I64`; the `#[host_fn]` macro marshals
+    //      `String` in/out through Extism memory handles.
+    //   3. The host gates the call on the `subprocess = ["yt-dlp"]`
+    //      capability declared in `plugin.toml`; a missing
+    //      capability causes the call to fail before the binary is
+    //      spawned.
+    //   4. Inputs/outputs are owned JSON strings — no aliasing.
+    let resp_json = unsafe { run_subprocess(req_json)? };
+    let stdout =
+        crate::yt_dlp::parse_subprocess_response(&resp_json).map_err(error_to_fn_error)?;
+    crate::yt_dlp::parse_download_path_from_stdout(&stdout).map_err(error_to_fn_error)
 }
 
 #[plugin_fn]
