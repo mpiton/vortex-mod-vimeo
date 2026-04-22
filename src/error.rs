@@ -36,4 +36,34 @@ pub enum PluginError {
     /// Player config contained no usable variants.
     #[error("no playable variants found for this Vimeo video")]
     NoVariantsFound,
+
+    /// Vimeo only exposes the video as an HLS/DASH adaptive stream at
+    /// the requested quality. The host's generic HTTP download engine
+    /// can't process an .m3u8 playlist, so the caller must fall back
+    /// to `download_to_file` which delegates to yt-dlp + ffmpeg.
+    ///
+    /// The message is load-bearing: Vortex core matches the literal
+    /// string `"adaptive stream (HLS/DASH)"` to recognise this case
+    /// (see the `is_adaptive_stream_error` helper in
+    /// `src-tauri/src/adapters/driven/plugin/extism_loader.rs`).
+    #[error(
+        "video is only available as an adaptive stream (HLS/DASH) at this quality; use download_to_file"
+    )]
+    AdaptiveStreamOnly,
+
+    /// yt-dlp subprocess returned a non-zero exit code.
+    #[error("yt-dlp failed (exit code {exit_code}): {stderr}")]
+    Subprocess { exit_code: i32, stderr: String },
+
+    /// yt-dlp succeeded but did not print the merged file path.
+    /// Distinct from `NoVariantsFound` — the download pipeline ran,
+    /// it just failed to tell us where the file landed.
+    #[error("yt-dlp produced no output file path (check stderr)")]
+    EmptyDownloadPath,
+
+    /// `output_dir` contains a yt-dlp format specifier (`%(...)s`),
+    /// which yt-dlp would expand inside the `--output` template and
+    /// write the file to an unexpected location.
+    #[error("output_dir contains a yt-dlp format specifier: {0}")]
+    InvalidOutputDir(String),
 }

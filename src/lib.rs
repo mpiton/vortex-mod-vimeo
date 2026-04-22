@@ -11,6 +11,7 @@
 pub mod error;
 pub mod parser;
 pub mod url_matcher;
+pub mod yt_dlp;
 
 #[cfg(target_family = "wasm")]
 mod plugin_api;
