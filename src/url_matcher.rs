@@ -165,7 +165,12 @@ pub fn extract_private_hash(url: &str) -> Option<String> {
         return Some(hash);
     }
 
-    if host == "player.vimeo.com" {
+    // Only accept `?h=<hash>` when the host *and* path match the
+    // documented player-embed shape (`player.vimeo.com/video/<id>`).
+    // Without the path check an unrelated player route (say a future
+    // `player.vimeo.com/channels/...`) could see its query parameter
+    // harvested as a share token.
+    if host == "player.vimeo.com" && player_video_regex().is_match(path_only) {
         return extract_h_query_param(path);
     }
 
@@ -173,8 +178,9 @@ pub fn extract_private_hash(url: &str) -> Option<String> {
 }
 
 /// Pull the `h=<hash>` value out of a raw path-and-query slice. Keeps
-/// the same `[a-f0-9]{8,}` shape enforced by `private_video_regex` so
-/// arbitrary query junk can't spoof a share token.
+/// the same lowercase `[a-f0-9]{8,}` shape enforced by
+/// `private_video_regex` so arbitrary query junk (or uppercase hex
+/// that Vimeo wouldn't produce) can't spoof a share token.
 fn extract_h_query_param(path_and_query: &str) -> Option<String> {
     // Fragment comes *before* any query in URL grammar, so a `?` that
     // shows up after a `#` is part of the fragment and must not be
@@ -184,7 +190,7 @@ fn extract_h_query_param(path_and_query: &str) -> Option<String> {
     let query = without_fragment.split_once('?')?.1;
     for pair in query.split('&') {
         if let Some(value) = pair.strip_prefix("h=") {
-            if value.len() >= 8 && value.chars().all(|c| c.is_ascii_hexdigit()) {
+            if value.len() >= 8 && value.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
                 return Some(value.to_string());
             }
         }
@@ -361,6 +367,31 @@ mod tests {
         // contain `?h=…`; the hash in the fragment must not be accepted.
         assert!(
             extract_private_hash("https://player.vimeo.com/video/123456789#?h=deadbeefcafe")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_from_player_query_rejects_uppercase_hex() {
+        // Vimeo share tokens are lowercase hex. Accepting uppercase
+        // here would diverge from the path-segment regex (`[a-f0-9]{8,}`)
+        // and let arbitrary query junk through. `is_ascii_hexdigit`
+        // accepts both cases so we intentionally narrow the predicate.
+        assert!(
+            extract_private_hash("https://player.vimeo.com/video/123456789?h=FBA859C46B")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_from_player_query_rejects_non_video_path() {
+        // `extract_h_query_param` is only reached for the documented
+        // `player.vimeo.com/video/<id>` shape. A different player route
+        // mustn't be treated as a share link carrier — the path regex
+        // acts as the symmetric counterpart to `private_video_regex`
+        // on the main host.
+        assert!(
+            extract_private_hash("https://player.vimeo.com/channels/example?h=fba859c46b")
                 .is_none()
         );
     }
