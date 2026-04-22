@@ -140,6 +140,19 @@ pub fn extract_video_id(url: &str) -> Option<String> {
     None
 }
 
+/// Extract the private-share hash token from a URL like
+/// `vimeo.com/<id>/<hash>`, or `None` if the URL has no hash segment.
+/// Used to keep the share-link token on the player embed URL when the
+/// `/config` JSON endpoint is refused and the plugin falls back to
+/// scraping the embed HTML.
+pub fn extract_private_hash(url: &str) -> Option<String> {
+    let (_, path) = validate_and_split(url)?;
+    let path_only = normalize_path(path);
+    private_video_regex()
+        .captures(path_only)
+        .and_then(|c| c.get(2).map(|m| m.as_str().to_string()))
+}
+
 /// Extract the numeric showcase / album ID from a URL or return `None`.
 pub fn extract_showcase_id(url: &str) -> Option<String> {
     let (_, path) = validate_and_split(url)?;
@@ -227,6 +240,36 @@ mod tests {
         assert_eq!(
             extract_video_id("https://vimeo.com/123456789/abcdef1234"),
             Some("123456789".into())
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_from_share_link() {
+        assert_eq!(
+            extract_private_hash("https://vimeo.com/123456789/abcdef1234"),
+            Some("abcdef1234".into())
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_none_for_public_video() {
+        assert!(extract_private_hash("https://vimeo.com/123456789").is_none());
+    }
+
+    #[test]
+    fn extract_private_hash_none_for_showcase() {
+        assert!(extract_private_hash("https://vimeo.com/showcase/98765").is_none());
+    }
+
+    #[test]
+    fn extract_private_hash_strips_query_and_fragment() {
+        assert_eq!(
+            extract_private_hash("https://vimeo.com/123456789/abcdef1234?autoplay=1"),
+            Some("abcdef1234".into())
+        );
+        assert_eq!(
+            extract_private_hash("https://vimeo.com/123456789/abcdef1234#t=30"),
+            Some("abcdef1234".into())
         );
     }
 

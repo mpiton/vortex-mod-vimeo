@@ -4,10 +4,10 @@ use extism_pdk::*;
 
 use crate::error::PluginError;
 use crate::parser::{
-    build_oembed_request, build_player_config_request, extract_player_config_from_html,
-    parse_http_response, parse_oembed, parse_player_config,
+    build_embed_html_request, build_oembed_request, build_player_config_request,
+    extract_player_config_from_html, parse_http_response, parse_oembed, parse_player_config,
 };
-use crate::url_matcher::extract_video_id;
+use crate::url_matcher::{extract_private_hash, extract_video_id};
 use crate::{
     build_media_variants_response, build_single_video_response, ensure_single_video,
     filter_audio_only, handle_can_handle, handle_supports_playlist, pick_variant_for_quality,
@@ -52,7 +52,8 @@ pub fn get_media_variants(url: String) -> FnResult<String> {
 
     let video_id = extract_video_id(&url)
         .ok_or_else(|| error_to_fn_error(PluginError::UnsupportedUrl(url.clone())))?;
-    let config = fetch_player_config(&video_id)?;
+    let hash = extract_private_hash(&url);
+    let config = fetch_player_config(&video_id, hash.as_deref())?;
     let variants = build_media_variants_response(config);
     let filtered = if audio_only_preference() {
         filter_audio_only(variants)
@@ -97,8 +98,9 @@ pub fn resolve_stream_url(input: String) -> FnResult<String> {
 
     let video_id = extract_video_id(&params.url)
         .ok_or_else(|| error_to_fn_error(PluginError::UnsupportedUrl(params.url.clone())))?;
+    let hash = extract_private_hash(&params.url);
 
-    let config = fetch_player_config(&video_id)?;
+    let config = fetch_player_config(&video_id, hash.as_deref())?;
     let variants = build_media_variants_response(config);
 
     // Audio-only mode: returns dedicated audio variants when present, or the
@@ -180,7 +182,12 @@ fn fetch_oembed(video_url: &str) -> FnResult<crate::parser::OembedResponse> {
     parse_oembed(&body).map_err(error_to_fn_error)
 }
 
-fn fetch_player_config(video_id: &str) -> FnResult<crate::parser::PlayerConfig> {
+fn fetch_player_config(
+    video_id: &str,
+    hash: Option<&str>,
+) -> FnResult<crate::parser::PlayerConfig> {
+    // Fast path: the JSON `/config` endpoint is authoritative and cheap
+    // to parse. Returns 200 for any publicly playable video.
     let req = build_player_config_request(video_id).map_err(error_to_fn_error)?;
     // SAFETY: identical host-function invariants to `fetch_oembed`
     // above — the host-side symbol, ABI, capability gate, and owned
@@ -188,18 +195,49 @@ fn fetch_player_config(video_id: &str) -> FnResult<crate::parser::PlayerConfig> 
     // list.
     let raw = unsafe { http_request(req)? };
     let resp = parse_http_response(&raw).map_err(error_to_fn_error)?;
-    let body = resp.into_success_body().map_err(error_to_fn_error)?;
-
-    // Vimeo returns JSON directly for /config. If the body happens to be
-    // an HTML page (e.g. geo-blocked fallback) try to extract the config
-    // block before giving up.
-    match parse_player_config(&body) {
-        Ok(cfg) => Ok(cfg),
-        Err(_) => {
-            let json = extract_player_config_from_html(&body).map_err(error_to_fn_error)?;
-            parse_player_config(json).map_err(error_to_fn_error)
+    match resp.into_success_body() {
+        Ok(body) => match parse_player_config(&body) {
+            Ok(cfg) => Ok(cfg),
+            Err(_) => {
+                // The `/config` endpoint occasionally returns HTML
+                // rather than JSON (observed as a geo-blocked
+                // intermediate page). Extract the embedded
+                // `playerConfig` from that HTML before giving up.
+                let json = extract_player_config_from_html(&body).map_err(error_to_fn_error)?;
+                parse_player_config(json).map_err(error_to_fn_error)
+            }
+        },
+        Err(PluginError::Private(_)) => {
+            // Domain-restricted / privacy-gated videos refuse the JSON
+            // `/config` endpoint (401/403) but still expose their
+            // streams via the embed HTML page, which carries the same
+            // `playerConfig` block inline in a `<script>` tag.
+            //
+            // This is exactly what yt-dlp does as its Vimeo primary
+            // strategy: scrape the embed HTML instead of relying on
+            // the JSON API that the player uses from an approved
+            // origin.
+            fetch_player_config_via_embed(video_id, hash)
         }
+        Err(e) => Err(error_to_fn_error(e)),
     }
+}
+
+/// Fallback that scrapes the player embed HTML page for its inline
+/// `playerConfig`. Returns a `Private` error if the embed itself is
+/// refused (e.g. login-gated video) — at that point the plugin has
+/// genuinely no anonymous way through.
+fn fetch_player_config_via_embed(
+    video_id: &str,
+    hash: Option<&str>,
+) -> FnResult<crate::parser::PlayerConfig> {
+    let req = build_embed_html_request(video_id, hash).map_err(error_to_fn_error)?;
+    // SAFETY: same invariants as `fetch_oembed` / the /config fetch.
+    let raw = unsafe { http_request(req)? };
+    let resp = parse_http_response(&raw).map_err(error_to_fn_error)?;
+    let body = resp.into_success_body().map_err(error_to_fn_error)?;
+    let json = extract_player_config_from_html(&body).map_err(error_to_fn_error)?;
+    parse_player_config(json).map_err(error_to_fn_error)
 }
 
 /// Hoist the variant matching the user's `default_quality` preference

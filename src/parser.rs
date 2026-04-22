@@ -601,6 +601,29 @@ pub fn build_player_config_request(video_id: &str) -> Result<String, PluginError
     Ok(serde_json::to_string(&req)?)
 }
 
+/// Build a GET for the player embed HTML page. The page carries the
+/// same `playerConfig` block as the JSON `/config` endpoint, inline in
+/// a `<script>` tag. Used as a fallback when `/config` is refused —
+/// domain-restricted / privacy-gated videos respond 403 on the JSON
+/// endpoint but still expose their streams via the embed HTML.
+///
+/// `hash` is the share-link token from a `vimeo.com/<id>/<hash>` URL,
+/// passed through as the `h=` query parameter so private share links
+/// keep working through the fallback path.
+pub fn build_embed_html_request(video_id: &str, hash: Option<&str>) -> Result<String, PluginError> {
+    let url = match hash {
+        Some(h) => format!("https://player.vimeo.com/video/{video_id}?h={h}"),
+        None => format!("https://player.vimeo.com/video/{video_id}"),
+    };
+    let req = HttpRequest {
+        method: "GET".into(),
+        url,
+        headers: HashMap::new(),
+        body: None,
+    };
+    Ok(serde_json::to_string(&req)?)
+}
+
 pub fn parse_http_response(raw: &str) -> Result<HttpResponse, PluginError> {
     serde_json::from_str(raw).map_err(|e| PluginError::HostResponse(e.to_string()))
 }
@@ -1089,6 +1112,20 @@ mod tests {
     fn build_player_config_request_shape() {
         let req = build_player_config_request("123456789").unwrap();
         assert!(req.contains("https://player.vimeo.com/video/123456789/config"));
+    }
+
+    #[test]
+    fn build_embed_html_request_without_hash() {
+        let req = build_embed_html_request("123456789", None).unwrap();
+        assert!(req.contains("\"method\":\"GET\""));
+        assert!(req.contains("https://player.vimeo.com/video/123456789"));
+        assert!(!req.contains("?h="), "request: {req}");
+    }
+
+    #[test]
+    fn build_embed_html_request_with_hash() {
+        let req = build_embed_html_request("123456789", Some("fba859c46b")).unwrap();
+        assert!(req.contains("https://player.vimeo.com/video/123456789?h=fba859c46b"));
     }
 
     #[test]
