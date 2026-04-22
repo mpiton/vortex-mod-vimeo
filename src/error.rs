@@ -54,4 +54,16 @@ pub enum PluginError {
     /// yt-dlp subprocess returned a non-zero exit code.
     #[error("yt-dlp failed (exit code {exit_code}): {stderr}")]
     Subprocess { exit_code: i32, stderr: String },
+
+    /// yt-dlp succeeded but did not print the merged file path.
+    /// Distinct from `NoVariantsFound` — the download pipeline ran,
+    /// it just failed to tell us where the file landed.
+    #[error("yt-dlp produced no output file path (check stderr)")]
+    EmptyDownloadPath,
+
+    /// `output_dir` contains a yt-dlp format specifier (`%(...)s`),
+    /// which yt-dlp would expand inside the `--output` template and
+    /// write the file to an unexpected location.
+    #[error("output_dir contains a yt-dlp format specifier: {0}")]
+    InvalidOutputDir(String),
 }

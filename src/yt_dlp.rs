@@ -39,6 +39,19 @@ pub struct SubprocessResponse {
 /// processes if yt-dlp genuinely can't make progress.
 pub const DEFAULT_DOWNLOAD_TIMEOUT_MS: u64 = 1_800_000;
 
+/// Reject any `output_dir` containing a yt-dlp format specifier
+/// (`%(key)s`). yt-dlp expands those patterns **inside** the
+/// `--output` template, so a path like `/tmp/%(title)s` would cause
+/// the file to be written somewhere surprising. A `%` that isn't
+/// part of a `%(` sequence (e.g. URL-encoded spaces) is harmless
+/// and allowed through.
+fn validate_output_dir(output_dir: &str) -> Result<(), PluginError> {
+    if output_dir.contains("%(") {
+        return Err(PluginError::InvalidOutputDir(output_dir.to_string()));
+    }
+    Ok(())
+}
+
 /// Build yt-dlp args for a full video download+merge.
 ///
 /// Writes the merged file to `output_dir/<id>.<ext>` and prints the
@@ -49,13 +62,19 @@ pub const DEFAULT_DOWNLOAD_TIMEOUT_MS: u64 = 1_800_000;
 ///
 /// `--` is used as a sentinel before the URL so a URL accidentally
 /// starting with `-` can never be interpreted as a yt-dlp option.
+///
+/// Returns [`PluginError::InvalidOutputDir`] when `output_dir`
+/// contains a yt-dlp format specifier — see [`validate_output_dir`]
+/// for the rationale.
 pub fn yt_dlp_args_for_download_to_file(
     url: &str,
     quality: &str,
     format: &str,
     output_dir: &str,
     audio_only: bool,
-) -> Vec<String> {
+) -> Result<Vec<String>, PluginError> {
+    validate_output_dir(output_dir)?;
+
     let selector = build_download_format_selector(quality, format, audio_only);
     let merge_format = if format.is_empty() || !format.chars().all(|c| c.is_ascii_alphanumeric()) {
         "mp4".to_string()
@@ -64,7 +83,7 @@ pub fn yt_dlp_args_for_download_to_file(
     };
     let output_template = format!("{output_dir}/%(id)s.%(ext)s");
 
-    vec![
+    Ok(vec![
         "--format".into(),
         selector,
         "--merge-output-format".into(),
@@ -85,7 +104,7 @@ pub fn yt_dlp_args_for_download_to_file(
         "3".into(),
         "--".into(),
         url.into(),
-    ]
+    ])
 }
 
 /// Build a yt-dlp format selector for HLS/DASH download+merge.
@@ -141,6 +160,11 @@ pub fn parse_subprocess_response(response_json: &str) -> Result<String, PluginEr
 /// line yt-dlp prints via `--print after_move:%(filepath)s`. Taking
 /// the last (not first) line guards against any leading output that
 /// may slip through even with `--quiet`.
+///
+/// Returns [`PluginError::EmptyDownloadPath`] (not `NoVariantsFound`)
+/// when stdout is empty — the download pipeline ran, it just didn't
+/// tell us where the file landed. Surfacing the right distinction in
+/// the error message keeps logs honest when debugging yt-dlp quirks.
 pub fn parse_download_path_from_stdout(stdout: &str) -> Result<String, PluginError> {
     stdout
         .lines()
@@ -148,7 +172,7 @@ pub fn parse_download_path_from_stdout(stdout: &str) -> Result<String, PluginErr
         .map(str::trim)
         .find(|l| !l.is_empty())
         .map(str::to_string)
-        .ok_or(PluginError::NoVariantsFound)
+        .ok_or(PluginError::EmptyDownloadPath)
 }
 
 /// Cap stderr at 512 characters on **character** boundaries so
@@ -173,7 +197,8 @@ mod tests {
     #[test]
     fn download_args_include_url_and_format() {
         let args =
-            yt_dlp_args_for_download_to_file("https://vimeo.com/123", "1080p", "mp4", "/tmp", false);
+            yt_dlp_args_for_download_to_file("https://vimeo.com/123", "1080p", "mp4", "/tmp", false)
+                .unwrap();
         // URL appears last, after the `--` sentinel.
         assert_eq!(args.last().map(String::as_str), Some("https://vimeo.com/123"));
         let sep_idx = args.iter().position(|a| a == "--").unwrap();
@@ -188,7 +213,8 @@ mod tests {
 
     #[test]
     fn download_args_default_merge_format_when_format_empty() {
-        let args = yt_dlp_args_for_download_to_file("https://vimeo.com/1", "", "", "/tmp", false);
+        let args = yt_dlp_args_for_download_to_file("https://vimeo.com/1", "", "", "/tmp", false)
+            .unwrap();
         let merge_idx = args.iter().position(|a| a == "--merge-output-format").unwrap();
         assert_eq!(args.get(merge_idx + 1).map(String::as_str), Some("mp4"));
     }
@@ -203,19 +229,54 @@ mod tests {
             "mp4;rm -rf /",
             "/tmp",
             false,
-        );
+        )
+        .unwrap();
         let merge_idx = args.iter().position(|a| a == "--merge-output-format").unwrap();
         assert_eq!(args.get(merge_idx + 1).map(String::as_str), Some("mp4"));
     }
 
     #[test]
     fn download_args_audio_only() {
-        let args =
-            yt_dlp_args_for_download_to_file("https://vimeo.com/1", "", "m4a", "/tmp", true);
+        let args = yt_dlp_args_for_download_to_file("https://vimeo.com/1", "", "m4a", "/tmp", true)
+            .unwrap();
         let fmt_idx = args.iter().position(|a| a == "--format").unwrap();
         let sel = args.get(fmt_idx + 1).map(String::as_str).unwrap();
         assert!(sel.contains("bestaudio"));
         assert!(sel.contains("[ext=m4a]"));
+    }
+
+    #[test]
+    fn download_args_reject_output_dir_with_format_specifier() {
+        // `%(key)s` sequences in the output dir would be expanded by
+        // yt-dlp inside the `--output` template, redirecting the file
+        // to an unexpected path.
+        let err = yt_dlp_args_for_download_to_file(
+            "https://vimeo.com/1",
+            "",
+            "",
+            "/tmp/%(title)s",
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PluginError::InvalidOutputDir(_)));
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("%(title)s"), "error should include the offending dir: {err_msg}");
+    }
+
+    #[test]
+    fn download_args_accept_output_dir_with_plain_percent() {
+        // A bare `%` (e.g. URL-encoded path segments) is harmless —
+        // only `%(` opens a yt-dlp format specifier.
+        assert!(
+            yt_dlp_args_for_download_to_file(
+                "https://vimeo.com/1",
+                "",
+                "",
+                "/tmp/100%20data",
+                false,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -225,9 +286,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_path_errors_on_empty_stdout() {
-        assert!(parse_download_path_from_stdout("").is_err());
-        assert!(parse_download_path_from_stdout("\n\n   \n").is_err());
+    fn parse_path_errors_with_empty_download_path_on_blank_stdout() {
+        // The distinction matters: yt-dlp ran successfully (exit 0 was
+        // already handled upstream) but didn't print a path. Reporting
+        // `NoVariantsFound` here would mislead users into thinking the
+        // video has no streams.
+        assert!(matches!(
+            parse_download_path_from_stdout(""),
+            Err(PluginError::EmptyDownloadPath)
+        ));
+        assert!(matches!(
+            parse_download_path_from_stdout("\n\n   \n"),
+            Err(PluginError::EmptyDownloadPath)
+        ));
     }
 
     #[test]

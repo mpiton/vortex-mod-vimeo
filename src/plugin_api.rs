@@ -190,7 +190,8 @@ pub fn download_to_file(input: String) -> FnResult<String> {
         &params.format,
         &params.output_dir,
         params.audio_only,
-    );
+    )
+    .map_err(error_to_fn_error)?;
     let req_json = crate::yt_dlp::build_download_request(args).map_err(error_to_fn_error)?;
 
     // SAFETY: `run_subprocess` is resolved by the Vortex plugin host
