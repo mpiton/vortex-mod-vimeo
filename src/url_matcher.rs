@@ -140,6 +140,72 @@ pub fn extract_video_id(url: &str) -> Option<String> {
     None
 }
 
+/// Extract the private-share hash token from a Vimeo URL, or `None`
+/// when the URL carries no hash. Used to keep the share-link token on
+/// the embed URL when the `/config` JSON endpoint is refused and the
+/// plugin falls back to scraping the embed HTML.
+///
+/// Two shapes are recognised:
+///
+/// - **Share link**: `vimeo.com/<id>/<hash>` — hash is the second path
+///   segment.
+/// - **Player iframe URL**: `player.vimeo.com/video/<id>?h=<hash>` —
+///   hash is the `h` query parameter. `extract_video_id` already
+///   accepts this URL shape, so we must also harvest the hash here
+///   or a caller arriving at the embed fallback via a player URL
+///   would silently drop the token and fail on restricted embeds.
+pub fn extract_private_hash(url: &str) -> Option<String> {
+    let (host, path) = validate_and_split(url)?;
+    // Gate on the Vimeo host set up front: the path-segment regex
+    // `/<id>/<hash>` is generic enough to match on any host, so
+    // without this check a URL like `evil.example.com/123/abcdef…`
+    // would produce a non-`None` result even though it has nothing
+    // to do with Vimeo.
+    if !is_vimeo_host(&host) {
+        return None;
+    }
+
+    let path_only = normalize_path(path);
+    if let Some(hash) = private_video_regex()
+        .captures(path_only)
+        .and_then(|c| c.get(2).map(|m| m.as_str().to_string()))
+    {
+        return Some(hash);
+    }
+
+    // Only accept `?h=<hash>` when the host *and* path match the
+    // documented player-embed shape (`player.vimeo.com/video/<id>`).
+    // Without the path check an unrelated player route (say a future
+    // `player.vimeo.com/channels/...`) could see its query parameter
+    // harvested as a share token.
+    if host == "player.vimeo.com" && player_video_regex().is_match(path_only) {
+        return extract_h_query_param(path);
+    }
+
+    None
+}
+
+/// Pull the `h=<hash>` value out of a raw path-and-query slice. Keeps
+/// the same lowercase `[a-f0-9]{8,}` shape enforced by
+/// `private_video_regex` so arbitrary query junk (or uppercase hex
+/// that Vimeo wouldn't produce) can't spoof a share token.
+fn extract_h_query_param(path_and_query: &str) -> Option<String> {
+    // Fragment comes *before* any query in URL grammar, so a `?` that
+    // shows up after a `#` is part of the fragment and must not be
+    // treated as the query delimiter. Strip the fragment first, then
+    // look for `?`.
+    let without_fragment = path_and_query.split('#').next().unwrap_or("");
+    let query = without_fragment.split_once('?')?.1;
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("h=") {
+            if value.len() >= 8 && value.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Extract the numeric showcase / album ID from a URL or return `None`.
 pub fn extract_showcase_id(url: &str) -> Option<String> {
     let (_, path) = validate_and_split(url)?;
@@ -227,6 +293,150 @@ mod tests {
         assert_eq!(
             extract_video_id("https://vimeo.com/123456789/abcdef1234"),
             Some("123456789".into())
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_from_share_link() {
+        assert_eq!(
+            extract_private_hash("https://vimeo.com/123456789/abcdef1234"),
+            Some("abcdef1234".into())
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_none_for_public_video() {
+        assert!(extract_private_hash("https://vimeo.com/123456789").is_none());
+    }
+
+    #[test]
+    fn extract_private_hash_none_for_showcase() {
+        assert!(extract_private_hash("https://vimeo.com/showcase/98765").is_none());
+    }
+
+    #[test]
+    fn extract_private_hash_strips_query_and_fragment() {
+        assert_eq!(
+            extract_private_hash("https://vimeo.com/123456789/abcdef1234?autoplay=1"),
+            Some("abcdef1234".into())
+        );
+        assert_eq!(
+            extract_private_hash("https://vimeo.com/123456789/abcdef1234#t=30"),
+            Some("abcdef1234".into())
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_from_player_query() {
+        // `player.vimeo.com/video/<id>?h=<hash>` is the URL shape the
+        // Vimeo player iframe uses. It needs to round-trip through
+        // `extract_private_hash` or the embed-HTML fallback would omit
+        // the token for restricted embeds.
+        assert_eq!(
+            extract_private_hash("https://player.vimeo.com/video/123456789?h=fba859c46b"),
+            Some("fba859c46b".into())
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_from_player_query_with_other_params() {
+        assert_eq!(
+            extract_private_hash(
+                "https://player.vimeo.com/video/123456789?app_id=122963&h=fba859c46b&autoplay=0"
+            ),
+            Some("fba859c46b".into())
+        );
+        assert_eq!(
+            extract_private_hash(
+                "https://player.vimeo.com/video/123456789?h=fba859c46b&app_id=122963"
+            ),
+            Some("fba859c46b".into())
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_from_player_query_rejects_non_hex() {
+        // Arbitrary `?h=…` junk must not spoof a hash.
+        assert!(
+            extract_private_hash("https://player.vimeo.com/video/123456789?h=NOT-A-HASH").is_none()
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_from_player_query_rejects_too_short() {
+        assert!(extract_private_hash("https://player.vimeo.com/video/123456789?h=abc").is_none());
+    }
+
+    #[test]
+    fn extract_private_hash_from_player_query_ignores_fragment() {
+        // `?` inside a fragment must not be mistaken for the query
+        // delimiter — the fragment (`#`) comes first in URL grammar.
+        // This URL has no real query, only a fragment that happens to
+        // contain `?h=…`; the hash in the fragment must not be accepted.
+        assert!(
+            extract_private_hash("https://player.vimeo.com/video/123456789#?h=deadbeefcafe")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_from_player_query_rejects_uppercase_hex() {
+        // Vimeo share tokens are lowercase hex. Accepting uppercase
+        // here would diverge from the path-segment regex (`[a-f0-9]{8,}`)
+        // and let arbitrary query junk through. `is_ascii_hexdigit`
+        // accepts both cases so we intentionally narrow the predicate.
+        assert!(
+            extract_private_hash("https://player.vimeo.com/video/123456789?h=FBA859C46B")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_from_player_query_rejects_non_video_path() {
+        // `extract_h_query_param` is only reached for the documented
+        // `player.vimeo.com/video/<id>` shape. A different player route
+        // mustn't be treated as a share link carrier — the path regex
+        // acts as the symmetric counterpart to `private_video_regex`
+        // on the main host.
+        assert!(
+            extract_private_hash("https://player.vimeo.com/channels/example?h=fba859c46b")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_from_player_query_with_trailing_fragment() {
+        // Real query followed by a fragment — hash extraction must still
+        // pick the query's value, not the fragment's.
+        assert_eq!(
+            extract_private_hash("https://player.vimeo.com/video/123456789?h=fba859c46b#t=30"),
+            Some("fba859c46b".into())
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_ignores_non_vimeo_host() {
+        // The path-segment regex `/<id>/<hash>` is generic enough to
+        // match on any host — gate on is_vimeo_host up front so an
+        // impostor URL can't spoof a Vimeo share token shape.
+        assert!(
+            extract_private_hash("https://evil.example.com/123456789/abcdef1234").is_none(),
+            "non-Vimeo hosts must not return a hash even with a matching path shape"
+        );
+        assert!(
+            extract_private_hash("https://player.example.com/123456789/abcdef1234").is_none()
+        );
+    }
+
+    #[test]
+    fn extract_private_hash_ignores_h_query_on_non_player_host() {
+        // `vimeo.com` doesn't use the `?h=` query shape — only
+        // `player.vimeo.com` does. Matching `?h=` on the main host
+        // would accept spoofed URLs like `vimeo.com/foo?h=deadbeef…`
+        // that aren't share links.
+        assert!(
+            extract_private_hash("https://vimeo.com/123456789?h=fba859c46b").is_none(),
+            "vimeo.com should use path-segment hash only"
         );
     }
 
