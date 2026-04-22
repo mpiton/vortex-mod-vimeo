@@ -76,25 +76,24 @@ pub fn yt_dlp_args_for_download_to_file(
     validate_output_dir(output_dir)?;
 
     let selector = build_download_format_selector(quality, format, audio_only);
-    // `--merge-output-format` requires a container (mp4, mkv, webm…),
-    // NOT a playlist/streaming format like `m3u8` or `mpd`. The
-    // `format` parameter reaching this function is a variant label —
-    // for HLS-only videos Vortex passes it as "m3u8", which yt-dlp
-    // refuses with `invalid merge output format "m3u8" given`.
+    // `--merge-output-format` accepts exactly these containers per
+    // yt-dlp docs: `avi, flv, mkv, mov, mp4, webm`. Anything else —
+    // `m3u8` from an HLS variant label, `m4a` as a naive audio
+    // choice, hostile injection attempts — must not reach this flag.
     //
-    // Keep the merge container narrow: mp4 for video, m4a for audio.
-    // Users don't realistically care about the container on an
-    // adaptive download — they care about quality, which is already
-    // captured via the format selector above. Accepting only our own
-    // two defaults also sidesteps any class of yt-dlp rejection.
-    let merge_format: String = if audio_only { "m4a" } else { "mp4" }.into();
+    // Use `mp4` unconditionally. For audio-only downloads the flag
+    // is ignored by yt-dlp (single stream, no merge needed), and the
+    // real output filename still comes from `%(ext)s` in the
+    // `--output` template, which picks up whatever container the
+    // `bestaudio[ext=…]` selector produced. So users who ask for
+    // audio-only still get the right extension on the saved file.
     let output_template = format!("{output_dir}/%(id)s.%(ext)s");
 
     Ok(vec![
         "--format".into(),
         selector,
         "--merge-output-format".into(),
-        merge_format,
+        "mp4".into(),
         "--output".into(),
         output_template,
         "--print".into(),
@@ -228,32 +227,33 @@ mod tests {
 
     #[test]
     fn download_args_merge_output_is_mp4_for_any_input_format() {
-        // `--merge-output-format` requires a container (mp4, mkv, webm…).
-        // Vortex passes the variant label through as `format`, which is
-        // "m3u8" for HLS-only videos — yt-dlp refuses that with
-        // `invalid merge output format "m3u8" given`. Hardcoding the
-        // merge container to mp4 (for video) or m4a (for audio) means
-        // no `format` value can slip through into this argument.
-        for input in ["", "mp4", "mkv", "m3u8", "mpd", "hls", "mp4;rm -rf /", "../../etc/passwd"] {
-            let args =
-                yt_dlp_args_for_download_to_file("https://vimeo.com/1", "", input, "/tmp", false)
-                    .unwrap();
-            let merge_idx = args.iter().position(|a| a == "--merge-output-format").unwrap();
-            assert_eq!(
-                args.get(merge_idx + 1).map(String::as_str),
-                Some("mp4"),
-                "merge-output-format must be mp4 regardless of input {input:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn download_args_merge_output_is_m4a_for_audio_only() {
-        let args =
-            yt_dlp_args_for_download_to_file("https://vimeo.com/1", "", "m3u8", "/tmp", true)
+        // `--merge-output-format` only accepts avi / flv / mkv / mov /
+        // mp4 / webm per yt-dlp docs. Passing any other value (the
+        // HLS label "m3u8", "m4a" as a naive audio choice, a hostile
+        // injection attempt) gets yt-dlp to exit 2 before the fetch.
+        // Hardcoding the merge container to mp4 — which yt-dlp ignores
+        // when no merge is required (audio-only downloads) — closes
+        // the whole class of "invalid merge output format" errors.
+        for audio_only in [false, true] {
+            for input in
+                ["", "mp4", "mkv", "m4a", "m3u8", "mpd", "hls", "mp4;rm -rf /", "../../etc/passwd"]
+            {
+                let args = yt_dlp_args_for_download_to_file(
+                    "https://vimeo.com/1",
+                    "",
+                    input,
+                    "/tmp",
+                    audio_only,
+                )
                 .unwrap();
-        let merge_idx = args.iter().position(|a| a == "--merge-output-format").unwrap();
-        assert_eq!(args.get(merge_idx + 1).map(String::as_str), Some("m4a"));
+                let merge_idx = args.iter().position(|a| a == "--merge-output-format").unwrap();
+                assert_eq!(
+                    args.get(merge_idx + 1).map(String::as_str),
+                    Some("mp4"),
+                    "merge-output-format must be mp4 for input {input:?} audio_only={audio_only}"
+                );
+            }
+        }
     }
 
     #[test]
