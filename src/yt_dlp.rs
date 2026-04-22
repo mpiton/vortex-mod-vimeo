@@ -76,18 +76,24 @@ pub fn yt_dlp_args_for_download_to_file(
     validate_output_dir(output_dir)?;
 
     let selector = build_download_format_selector(quality, format, audio_only);
-    let merge_format = if format.is_empty() || !format.chars().all(|c| c.is_ascii_alphanumeric()) {
-        "mp4".to_string()
-    } else {
-        format.to_string()
-    };
+    // `--merge-output-format` accepts exactly these containers per
+    // yt-dlp docs: `avi, flv, mkv, mov, mp4, webm`. Anything else —
+    // `m3u8` from an HLS variant label, `m4a` as a naive audio
+    // choice, hostile injection attempts — must not reach this flag.
+    //
+    // Use `mp4` unconditionally. For audio-only downloads the flag
+    // is ignored by yt-dlp (single stream, no merge needed), and the
+    // real output filename still comes from `%(ext)s` in the
+    // `--output` template, which picks up whatever container the
+    // `bestaudio[ext=…]` selector produced. So users who ask for
+    // audio-only still get the right extension on the saved file.
     let output_template = format!("{output_dir}/%(id)s.%(ext)s");
 
     Ok(vec![
         "--format".into(),
         selector,
         "--merge-output-format".into(),
-        merge_format,
+        "mp4".into(),
         "--output".into(),
         output_template,
         "--print".into(),
@@ -220,19 +226,34 @@ mod tests {
     }
 
     #[test]
-    fn download_args_reject_non_alphanum_format() {
-        // A hostile `format` like `mp4;rm -rf /` must NOT end up as a
-        // yt-dlp argument; we fall back to the default mp4 merge.
-        let args = yt_dlp_args_for_download_to_file(
-            "https://vimeo.com/1",
-            "",
-            "mp4;rm -rf /",
-            "/tmp",
-            false,
-        )
-        .unwrap();
-        let merge_idx = args.iter().position(|a| a == "--merge-output-format").unwrap();
-        assert_eq!(args.get(merge_idx + 1).map(String::as_str), Some("mp4"));
+    fn download_args_merge_output_is_mp4_for_any_input_format() {
+        // `--merge-output-format` only accepts avi / flv / mkv / mov /
+        // mp4 / webm per yt-dlp docs. Passing any other value (the
+        // HLS label "m3u8", "m4a" as a naive audio choice, a hostile
+        // injection attempt) gets yt-dlp to exit 2 before the fetch.
+        // Hardcoding the merge container to mp4 — which yt-dlp ignores
+        // when no merge is required (audio-only downloads) — closes
+        // the whole class of "invalid merge output format" errors.
+        for audio_only in [false, true] {
+            for input in
+                ["", "mp4", "mkv", "m4a", "m3u8", "mpd", "hls", "mp4;rm -rf /", "../../etc/passwd"]
+            {
+                let args = yt_dlp_args_for_download_to_file(
+                    "https://vimeo.com/1",
+                    "",
+                    input,
+                    "/tmp",
+                    audio_only,
+                )
+                .unwrap();
+                let merge_idx = args.iter().position(|a| a == "--merge-output-format").unwrap();
+                assert_eq!(
+                    args.get(merge_idx + 1).map(String::as_str),
+                    Some("mp4"),
+                    "merge-output-format must be mp4 for input {input:?} audio_only={audio_only}"
+                );
+            }
+        }
     }
 
     #[test]
