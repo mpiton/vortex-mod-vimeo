@@ -576,6 +576,18 @@ fn is_js_ident_continue(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
+/// Headers every Vimeo request needs to ship with. `Accept-Encoding:
+/// identity` is the only non-empty entry: Vimeo will otherwise gzip
+/// the response body, but the Vortex host's `reqwest` client isn't
+/// built with the `gzip` feature, so the plugin would receive
+/// compressed bytes and fail to decode the HTML or JSON payload.
+/// Asking for identity encoding up-front sidesteps the whole thing.
+fn vimeo_headers() -> HashMap<String, String> {
+    let mut h = HashMap::new();
+    h.insert("Accept-Encoding".into(), "identity".into());
+    h
+}
+
 pub fn build_oembed_request(video_url: &str) -> Result<String, PluginError> {
     let url = format!(
         "https://vimeo.com/api/oembed.json?url={}",
@@ -584,7 +596,7 @@ pub fn build_oembed_request(video_url: &str) -> Result<String, PluginError> {
     let req = HttpRequest {
         method: "GET".into(),
         url,
-        headers: HashMap::new(),
+        headers: vimeo_headers(),
         body: None,
     };
     Ok(serde_json::to_string(&req)?)
@@ -595,7 +607,7 @@ pub fn build_player_config_request(video_id: &str) -> Result<String, PluginError
     let req = HttpRequest {
         method: "GET".into(),
         url,
-        headers: HashMap::new(),
+        headers: vimeo_headers(),
         body: None,
     };
     Ok(serde_json::to_string(&req)?)
@@ -618,7 +630,7 @@ pub fn build_embed_html_request(video_id: &str, hash: Option<&str>) -> Result<St
     let req = HttpRequest {
         method: "GET".into(),
         url,
-        headers: HashMap::new(),
+        headers: vimeo_headers(),
         body: None,
     };
     Ok(serde_json::to_string(&req)?)
@@ -1126,6 +1138,26 @@ mod tests {
     fn build_embed_html_request_with_hash() {
         let req = build_embed_html_request("123456789", Some("fba859c46b")).unwrap();
         assert!(req.contains("https://player.vimeo.com/video/123456789?h=fba859c46b"));
+    }
+
+    #[test]
+    fn all_builders_pin_identity_encoding() {
+        // Every Vimeo endpoint we hit must ask for `Accept-Encoding:
+        // identity` — the Vortex host's reqwest client is not built
+        // with the `gzip` feature, so a compressed response comes back
+        // as raw bytes that fail downstream parsing (seen as
+        // "Vimeo player config not found on page").
+        for req in [
+            build_oembed_request("https://vimeo.com/1").unwrap(),
+            build_player_config_request("1").unwrap(),
+            build_embed_html_request("1", None).unwrap(),
+            build_embed_html_request("1", Some("abcdef1234")).unwrap(),
+        ] {
+            assert!(
+                req.contains(r#""Accept-Encoding":"identity""#),
+                "missing identity encoding header in: {req}"
+            );
+        }
     }
 
     #[test]
