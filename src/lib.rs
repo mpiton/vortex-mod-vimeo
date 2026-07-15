@@ -439,6 +439,37 @@ mod tests {
     }
 
     #[test]
+    fn resolve_audio_only_url_returns_first_dedicated_audio_variant() {
+        let variants = MediaVariantsResponse {
+            variants: vec![
+                MediaVariant {
+                    format_id: "audio-128".into(),
+                    kind: VariantKind::Audio,
+                    ext: "m4a".into(),
+                    width: None,
+                    height: None,
+                    fps: None,
+                    url: "https://cdn.example/audio-128.m4a".into(),
+                },
+                MediaVariant {
+                    format_id: "audio-64".into(),
+                    kind: VariantKind::Audio,
+                    ext: "m4a".into(),
+                    width: None,
+                    height: None,
+                    fps: None,
+                    url: "https://cdn.example/audio-64.m4a".into(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            resolve_audio_only_url(variants).unwrap(),
+            "https://cdn.example/audio-128.m4a"
+        );
+    }
+
+    #[test]
     fn pick_variant_below_preferred_quality() {
         let r = build_media_variants_response(sample_config_with_all());
         let picked = pick_variant_for_quality(&r.variants, "720p").unwrap();
