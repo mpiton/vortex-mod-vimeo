@@ -71,16 +71,18 @@ pub fn get_media_variants(url: String) -> FnResult<String> {
     Ok(serde_json::to_string(&reordered)?)
 }
 
-/// Resolve a direct CDN stream URL for a single video.
+/// Resolve a directly downloadable stream URL for a single video.
 ///
 /// Input JSON: `{ "url", "quality"?, "format"?, "audio_only"? }`.
-/// Returns the raw CDN URL string so the host can pass it directly to the
-/// download engine. For progressive variants this is an MP4 CDN link; for
-/// the adaptive stream it is an HLS m3u8 manifest URL.
+/// Returns the raw CDN URL for a progressive MP4, or for a dedicated audio
+/// variant when `audio_only` is set and Vimeo exposes one. It deliberately
+/// never returns an adaptive HLS manifest: when only HLS/DASH remains it
+/// returns `AdaptiveStreamOnly` so the host can call `download_to_file`.
 ///
 /// `quality` is matched against progressive variant heights (e.g. `"720p"`).
-/// When no progressive variant matches, the HLS adaptive stream is returned.
-/// `audio_only` filters to audio-only variants when set. `format` is not
+/// When no progressive variant matches, the highest progressive variant is
+/// used. In `audio_only` mode, an adaptive-only result also returns
+/// `AdaptiveStreamOnly` so yt-dlp can extract the audio. `format` is not
 /// currently supported as Vimeo exposes only one format per quality level.
 #[plugin_fn]
 pub fn resolve_stream_url(input: String) -> FnResult<String> {

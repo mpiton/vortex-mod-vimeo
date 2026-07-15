@@ -17,6 +17,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   preferences, and output directory; the trusted host owns the binary,
   command-line arguments, timeout, environment, and working directory.
 
-## [1.3.1] - previous release
+## [1.3.1] - 2026-04-22
 
 - Previous releases were not documented in this file.
