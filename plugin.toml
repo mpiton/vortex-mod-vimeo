@@ -1,20 +1,19 @@
 [plugin]
 name = "vortex-mod-vimeo"
-version = "1.3.1"
+version = "1.4.0"
 category = "crawler"
 author = "vortex-community"
 description = "Vimeo public/private videos with quality selection"
 license = "GPL-3.0"
-min_vortex_version = "0.1.0"
+min_vortex_version = "0.2.0"
 
 [capabilities]
 # Vimeo parsing needs oEmbed JSON plus the public player config JSON.
 # Both are fetched via the host `http_request` host function.
 http = true
-# yt-dlp is invoked by `download_to_file` when Vimeo only exposes the
-# video as an HLS/DASH adaptive stream. The Vortex download engine
-# can't process .m3u8 playlists directly, so the plugin delegates the
-# segment-fetch-and-merge pipeline to yt-dlp + ffmpeg.
+# `download_to_file` delegates HLS/DASH downloads to Vortex's typed
+# `run_ytdlp` broker. This existing capability authorises the broker;
+# the trusted host owns the binary, arguments, timeout, and environment.
 subprocess = ["yt-dlp"]
 
 [config]

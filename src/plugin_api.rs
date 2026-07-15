@@ -11,17 +11,15 @@ use crate::url_matcher::{extract_private_hash, extract_video_id};
 use crate::{
     build_media_variants_response, build_single_video_response, ensure_single_video,
     filter_audio_only, handle_can_handle, handle_supports_playlist, pick_variant_for_quality,
-    MediaVariant, MediaVariantsResponse, VariantKind,
+    resolve_audio_only_url, MediaVariant, MediaVariantsResponse, VariantKind,
 };
 
 #[host_fn]
 extern "ExtismHost" {
     fn http_request(req: String) -> String;
     fn get_config(key: String) -> String;
-    /// JSON in → JSON out — see `yt_dlp::SubprocessRequest` /
-    /// `yt_dlp::SubprocessResponse`. Used by `download_to_file` for
-    /// the HLS/DASH adaptive fallback.
-    fn run_subprocess(req: String) -> String;
+    /// Typed yt-dlp broker used by the HLS/DASH adaptive fallback.
+    fn run_ytdlp(req: String) -> String;
 }
 
 #[plugin_fn]
@@ -107,17 +105,11 @@ pub fn resolve_stream_url(input: String) -> FnResult<String> {
     let config = fetch_player_config(&video_id, hash.as_deref())?;
     let variants = build_media_variants_response(config);
 
-    // Audio-only mode: returns dedicated audio variants when present, or the
-    // adaptive HLS stream when no dedicated audio variant exists (filter_audio_only
-    // retains Adaptive entries for downstream demuxing).
+    // Audio-only mode: return a dedicated audio variant when present. An
+    // adaptive HLS-only response must use `download_to_file` so the host can
+    // extract the audio instead of saving the manifest as the media file.
     if params.audio_only {
-        let cdn_url = filter_audio_only(variants)
-            .variants
-            .into_iter()
-            .next()
-            .map(|v| v.url)
-            .ok_or_else(|| error_to_fn_error(PluginError::NoVariantsFound))?;
-        return Ok(cdn_url);
+        return resolve_audio_only_url(variants).map_err(error_to_fn_error);
     }
 
     // Prefer the highest progressive MP4; signal `AdaptiveStreamOnly`
@@ -184,7 +176,7 @@ pub fn download_to_file(input: String) -> FnResult<String> {
 
     ensure_single_video(&params.url).map_err(error_to_fn_error)?;
 
-    let args = crate::yt_dlp::yt_dlp_args_for_download_to_file(
+    let req_json = crate::yt_dlp::build_download_request(
         &params.url,
         &params.quality,
         &params.format,
@@ -192,23 +184,19 @@ pub fn download_to_file(input: String) -> FnResult<String> {
         params.audio_only,
     )
     .map_err(error_to_fn_error)?;
-    let req_json = crate::yt_dlp::build_download_request(args).map_err(error_to_fn_error)?;
 
-    // SAFETY: `run_subprocess` is resolved by the Vortex plugin host
+    // SAFETY: `run_ytdlp` is resolved by the Vortex plugin host
     // at load time (see src-tauri/src/adapters/driven/plugin/
-    // host_functions.rs: `make_run_subprocess_function`). Invariants:
+    // host_functions.rs: `make_run_ytdlp_function`). Invariants:
     //   1. The host registers the symbol in the `ExtismHost`
     //      namespace before any `#[plugin_fn]` export is callable.
     //   2. The ABI is `(I64) -> I64`; the `#[host_fn]` macro marshals
     //      `String` in/out through Extism memory handles.
-    //   3. The host gates the call on the `subprocess = ["yt-dlp"]`
-    //      capability declared in `plugin.toml`; a missing
-    //      capability causes the call to fail before the binary is
-    //      spawned.
+    //   3. The host validates the declared capability and builds every
+    //      process argument from the typed request contract.
     //   4. Inputs/outputs are owned JSON strings — no aliasing.
-    let resp_json = unsafe { run_subprocess(req_json)? };
-    let stdout =
-        crate::yt_dlp::parse_subprocess_response(&resp_json).map_err(error_to_fn_error)?;
+    let resp_json = unsafe { run_ytdlp(req_json)? };
+    let stdout = crate::yt_dlp::parse_ytdlp_response(&resp_json).map_err(error_to_fn_error)?;
     crate::yt_dlp::parse_download_path_from_stdout(&stdout).map_err(error_to_fn_error)
 }
 

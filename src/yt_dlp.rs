@@ -1,158 +1,85 @@
-//! yt-dlp subprocess request/response helpers for the HLS/DASH
-//! fallback path used by `download_to_file`.
+//! Typed request/response helpers for the host-managed yt-dlp broker.
 //!
 //! Vimeo serves most videos as HLS-only at quality ≥ 720p; the
 //! Vortex download engine only knows how to fetch a single HTTPS
 //! URL, so when `resolve_stream_url` can't find a progressive
 //! variant it surfaces [`PluginError::AdaptiveStreamOnly`] and the
-//! host delegates to yt-dlp through `download_to_file`. This
-//! module builds the request/parses the response — the actual
-//! host-function call is in `plugin_api.rs`.
-//!
-//! The design mirrors `vortex-mod-youtube::extractor` so the two
-//! plugins stay consistent; yt-dlp quirks only need to be fixed
-//! once.
+//! host delegates to yt-dlp through `download_to_file`.
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::PluginError;
 
-/// JSON request shape expected by the host's `run_subprocess` function.
+/// Closed request contract accepted by Vortex's `run_ytdlp` host function.
+///
+/// Process selection, command-line arguments, timeouts, environment, and the
+/// working directory are deliberately absent: those controls belong to the
+/// trusted host.
 #[derive(Debug, Serialize)]
-pub struct SubprocessRequest {
-    pub binary: String,
-    pub args: Vec<String>,
-    pub timeout_ms: u64,
+#[serde(tag = "action", rename_all = "snake_case")]
+enum YtDlpRequest<'a> {
+    Download {
+        url: &'a str,
+        quality: Option<u32>,
+        format: Option<&'a str>,
+        output_dir: &'a str,
+        audio_only: bool,
+    },
 }
 
-/// JSON response shape returned by the host's `run_subprocess` function.
+/// JSON response shape returned by the host's `run_ytdlp` function.
 #[derive(Debug, Deserialize)]
-pub struct SubprocessResponse {
-    pub exit_code: i32,
-    pub stdout: String,
-    pub stderr: String,
+struct YtDlpResponse {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
 }
 
-/// Default timeout for a full video download+merge — 30 minutes.
-/// Vimeo's HLS segments can be slow to fetch when the CDN is warming
-/// up; 30 minutes gives plenty of headroom without leaving hung
-/// processes if yt-dlp genuinely can't make progress.
-pub const DEFAULT_DOWNLOAD_TIMEOUT_MS: u64 = 1_800_000;
-
-/// Reject any `output_dir` containing a yt-dlp format specifier
-/// (`%(key)s`). yt-dlp expands those patterns **inside** the
-/// `--output` template, so a path like `/tmp/%(title)s` would cause
-/// the file to be written somewhere surprising. A `%` that isn't
-/// part of a `%(` sequence (e.g. URL-encoded spaces) is harmless
-/// and allowed through.
-fn validate_output_dir(output_dir: &str) -> Result<(), PluginError> {
-    if output_dir.contains("%(") {
-        return Err(PluginError::InvalidOutputDir(output_dir.to_string()));
-    }
-    Ok(())
-}
-
-/// Build yt-dlp args for a full video download+merge.
-///
-/// Writes the merged file to `output_dir/<id>.<ext>` and prints the
-/// absolute path on the `after_move` hook so the caller can parse it
-/// from stdout. `--print after_move:%(filepath)s` is the canonical
-/// yt-dlp way to return "the file you just wrote" without relying on
-/// template interpolation at the shell level.
-///
-/// `--` is used as a sentinel before the URL so a URL accidentally
-/// starting with `-` can never be interpreted as a yt-dlp option.
-///
-/// Returns [`PluginError::InvalidOutputDir`] when `output_dir`
-/// contains a yt-dlp format specifier — see [`validate_output_dir`]
-/// for the rationale.
-pub fn yt_dlp_args_for_download_to_file(
+/// Serialize the Vimeo download operation for the trusted broker.
+pub fn build_download_request(
     url: &str,
     quality: &str,
     format: &str,
     output_dir: &str,
     audio_only: bool,
-) -> Result<Vec<String>, PluginError> {
-    validate_output_dir(output_dir)?;
-
-    let selector = build_download_format_selector(quality, format, audio_only);
-    // `--merge-output-format` accepts exactly these containers per
-    // yt-dlp docs: `avi, flv, mkv, mov, mp4, webm`. Anything else —
-    // `m3u8` from an HLS variant label, `m4a` as a naive audio
-    // choice, hostile injection attempts — must not reach this flag.
-    //
-    // Use `mp4` unconditionally. For audio-only downloads the flag
-    // is ignored by yt-dlp (single stream, no merge needed), and the
-    // real output filename still comes from `%(ext)s` in the
-    // `--output` template, which picks up whatever container the
-    // `bestaudio[ext=…]` selector produced. So users who ask for
-    // audio-only still get the right extension on the saved file.
-    let output_template = format!("{output_dir}/%(id)s.%(ext)s");
-
-    Ok(vec![
-        "--format".into(),
-        selector,
-        "--merge-output-format".into(),
-        "mp4".into(),
-        "--output".into(),
-        output_template,
-        "--print".into(),
-        "after_move:%(filepath)s".into(),
-        "--no-playlist".into(),
-        "--no-warnings".into(),
-        "--quiet".into(),
-        // Fragment retries matter more for Vimeo than the HTTP
-        // retries: HLS/DASH pulls dozens of .ts or .m4s chunks and
-        // a single 503 would otherwise kill the whole download.
-        "--retries".into(),
-        "3".into(),
-        "--fragment-retries".into(),
-        "3".into(),
-        "--".into(),
-        url.into(),
-    ])
-}
-
-/// Build a yt-dlp format selector for HLS/DASH download+merge.
-///
-/// Video: `bestvideo[height<=H]+bestaudio` (DASH video + audio merged
-/// via ffmpeg). Falls back to `best[height<=H]` when the two-stream
-/// combo isn't available. Audio-only: `bestaudio[ext=FORMAT]/bestaudio`.
-fn build_download_format_selector(quality: &str, format: &str, audio_only: bool) -> String {
-    let height: Option<u32> = quality.trim_end_matches('p').parse().ok();
-    let has_format = !format.is_empty() && format.chars().all(|c| c.is_ascii_alphanumeric());
-
-    if audio_only {
-        if has_format {
-            format!("bestaudio[ext={format}]/bestaudio")
+) -> Result<String, PluginError> {
+    let request = YtDlpRequest::Download {
+        url,
+        quality: parse_quality(quality),
+        format: if audio_only {
+            optional_audio_format(format)
         } else {
-            "bestaudio".into()
-        }
-    } else {
-        match height {
-            Some(h) => format!(
-                "bestvideo[height<={h}]+bestaudio/bestvideo[height<={h}]+bestaudio[ext=m4a]/best[height<={h}]"
-            ),
-            None => "bestvideo+bestaudio/best".into(),
-        }
-    }
-}
-
-/// Build the subprocess request JSON with the download-scale timeout.
-pub fn build_download_request(args: Vec<String>) -> Result<String, PluginError> {
-    let req = SubprocessRequest {
-        binary: "yt-dlp".into(),
-        args,
-        timeout_ms: DEFAULT_DOWNLOAD_TIMEOUT_MS,
+            None
+        },
+        output_dir,
+        audio_only,
     };
-    Ok(serde_json::to_string(&req)?)
+    Ok(serde_json::to_string(&request)?)
 }
 
-/// Parse the host's subprocess response and extract stdout, or map
+fn parse_quality(quality: &str) -> Option<u32> {
+    let quality = quality.trim();
+    if quality.is_empty() || quality.eq_ignore_ascii_case("best") {
+        return None;
+    }
+    quality.trim_end_matches('p').parse().ok()
+}
+
+fn optional_audio_format(format: &str) -> Option<&'static str> {
+    const AUDIO_FORMATS: [&str; 9] = [
+        "aac", "flac", "m4a", "mp3", "ogg", "opus", "vorbis", "wav", "webm",
+    ];
+    let format = format.trim();
+    AUDIO_FORMATS
+        .into_iter()
+        .find(|allowed| format.eq_ignore_ascii_case(allowed))
+}
+
+/// Parse the host broker's response and extract stdout, or map
 /// non-zero exit to [`PluginError::Subprocess`] with a bounded-size
 /// stderr excerpt so error messages don't balloon.
-pub fn parse_subprocess_response(response_json: &str) -> Result<String, PluginError> {
-    let resp: SubprocessResponse = serde_json::from_str(response_json)?;
+pub fn parse_ytdlp_response(response_json: &str) -> Result<String, PluginError> {
+    let resp: YtDlpResponse = serde_json::from_str(response_json)?;
     if resp.exit_code != 0 {
         return Err(PluginError::Subprocess {
             exit_code: resp.exit_code,
@@ -201,109 +128,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn download_args_include_url_and_format() {
-        let args =
-            yt_dlp_args_for_download_to_file("https://vimeo.com/123", "1080p", "mp4", "/tmp", false)
-                .unwrap();
-        // URL appears last, after the `--` sentinel.
-        assert_eq!(args.last().map(String::as_str), Some("https://vimeo.com/123"));
-        let sep_idx = args.iter().position(|a| a == "--").unwrap();
-        let url_idx = args.iter().rposition(|a| a == "https://vimeo.com/123").unwrap();
-        assert!(url_idx > sep_idx, "URL must follow the -- sentinel");
-        // Quality height threaded into the selector.
-        assert!(args.iter().any(|a| a.contains("height<=1080")));
-        // mp4 is requested as the merge output.
-        let merge_idx = args.iter().position(|a| a == "--merge-output-format").unwrap();
-        assert_eq!(args.get(merge_idx + 1).map(String::as_str), Some("mp4"));
-    }
-
-    #[test]
-    fn download_args_default_merge_format_when_format_empty() {
-        let args = yt_dlp_args_for_download_to_file("https://vimeo.com/1", "", "", "/tmp", false)
-            .unwrap();
-        let merge_idx = args.iter().position(|a| a == "--merge-output-format").unwrap();
-        assert_eq!(args.get(merge_idx + 1).map(String::as_str), Some("mp4"));
-    }
-
-    #[test]
-    fn download_args_merge_output_is_mp4_for_any_input_format() {
-        // `--merge-output-format` only accepts avi / flv / mkv / mov /
-        // mp4 / webm per yt-dlp docs. Passing any other value (the
-        // HLS label "m3u8", "m4a" as a naive audio choice, a hostile
-        // injection attempt) gets yt-dlp to exit 2 before the fetch.
-        // Hardcoding the merge container to mp4 — which yt-dlp ignores
-        // when no merge is required (audio-only downloads) — closes
-        // the whole class of "invalid merge output format" errors.
-        for audio_only in [false, true] {
-            for input in
-                ["", "mp4", "mkv", "m4a", "m3u8", "mpd", "hls", "mp4;rm -rf /", "../../etc/passwd"]
-            {
-                let args = yt_dlp_args_for_download_to_file(
-                    "https://vimeo.com/1",
-                    "",
-                    input,
-                    "/tmp",
-                    audio_only,
-                )
-                .unwrap();
-                let merge_idx = args.iter().position(|a| a == "--merge-output-format").unwrap();
-                assert_eq!(
-                    args.get(merge_idx + 1).map(String::as_str),
-                    Some("mp4"),
-                    "merge-output-format must be mp4 for input {input:?} audio_only={audio_only}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn download_args_audio_only() {
-        let args = yt_dlp_args_for_download_to_file("https://vimeo.com/1", "", "m4a", "/tmp", true)
-            .unwrap();
-        let fmt_idx = args.iter().position(|a| a == "--format").unwrap();
-        let sel = args.get(fmt_idx + 1).map(String::as_str).unwrap();
-        assert!(sel.contains("bestaudio"));
-        assert!(sel.contains("[ext=m4a]"));
-    }
-
-    #[test]
-    fn download_args_reject_output_dir_with_format_specifier() {
-        // `%(key)s` sequences in the output dir would be expanded by
-        // yt-dlp inside the `--output` template, redirecting the file
-        // to an unexpected path.
-        let err = yt_dlp_args_for_download_to_file(
-            "https://vimeo.com/1",
-            "",
-            "",
-            "/tmp/%(title)s",
-            false,
-        )
-        .unwrap_err();
-        assert!(matches!(err, PluginError::InvalidOutputDir(_)));
-        let err_msg = err.to_string();
-        assert!(err_msg.contains("%(title)s"), "error should include the offending dir: {err_msg}");
-    }
-
-    #[test]
-    fn download_args_accept_output_dir_with_plain_percent() {
-        // A bare `%` (e.g. URL-encoded path segments) is harmless —
-        // only `%(` opens a yt-dlp format specifier.
-        assert!(
-            yt_dlp_args_for_download_to_file(
-                "https://vimeo.com/1",
-                "",
-                "",
-                "/tmp/100%20data",
-                false,
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
     fn parse_path_picks_last_non_empty_line() {
         let stdout = "\n[info] some chatter\n/tmp/output/1234.mp4\n\n";
-        assert_eq!(parse_download_path_from_stdout(stdout).unwrap(), "/tmp/output/1234.mp4");
+        assert_eq!(
+            parse_download_path_from_stdout(stdout).unwrap(),
+            "/tmp/output/1234.mp4"
+        );
     }
 
     #[test]
@@ -325,14 +155,14 @@ mod tests {
     #[test]
     fn parse_response_propagates_non_zero_exit() {
         let json = r#"{"exit_code":1,"stdout":"","stderr":"boom"}"#;
-        let err = parse_subprocess_response(json).unwrap_err();
+        let err = parse_ytdlp_response(json).unwrap_err();
         assert!(matches!(err, PluginError::Subprocess { exit_code: 1, .. }));
     }
 
     #[test]
     fn parse_response_ok_returns_stdout() {
         let json = r#"{"exit_code":0,"stdout":"/tmp/out.mp4\n","stderr":""}"#;
-        assert_eq!(parse_subprocess_response(json).unwrap(), "/tmp/out.mp4\n");
+        assert_eq!(parse_ytdlp_response(json).unwrap(), "/tmp/out.mp4\n");
     }
 
     #[test]
@@ -347,9 +177,64 @@ mod tests {
     }
 
     #[test]
-    fn build_request_serialises_with_yt_dlp_binary() {
-        let req = build_download_request(vec!["--version".into()]).unwrap();
-        assert!(req.contains("\"binary\":\"yt-dlp\""));
-        assert!(req.contains("\"timeout_ms\":1800000"));
+    fn download_request_uses_typed_broker_contract() {
+        let req = build_download_request(
+            "https://vimeo.com/123",
+            "1080p",
+            "m3u8",
+            "/tmp/downloads",
+            false,
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&req).unwrap();
+
+        assert_eq!(json["action"], "download");
+        assert_eq!(json["url"], "https://vimeo.com/123");
+        assert_eq!(json["quality"], 1080);
+        assert!(json["format"].is_null());
+        assert_eq!(json["output_dir"], "/tmp/downloads");
+        assert_eq!(json["audio_only"], false);
+        for forbidden in ["binary", "args", "timeout_ms"] {
+            assert!(
+                json.get(forbidden).is_none(),
+                "unexpected process control: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn download_request_serialises_empty_options_as_null() {
+        let req = build_download_request("https://vimeo.com/123", "", "", "/tmp/downloads", true)
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&req).unwrap();
+
+        assert!(json["quality"].is_null());
+        assert!(json["format"].is_null());
+        assert_eq!(json["audio_only"], true);
+    }
+
+    #[test]
+    fn audio_request_only_serialises_supported_audio_formats() {
+        let req = build_download_request(
+            "https://vimeo.com/123",
+            "audio_only",
+            "m4a",
+            "/tmp/downloads",
+            true,
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&req).unwrap();
+        assert_eq!(json["format"], "m4a");
+
+        let req = build_download_request(
+            "https://vimeo.com/123",
+            "audio_only",
+            "m3u8",
+            "/tmp/downloads",
+            true,
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&req).unwrap();
+        assert!(json["format"].is_null());
     }
 }

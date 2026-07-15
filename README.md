@@ -15,8 +15,8 @@ Vimeo WASM plugin for [Vortex](https://github.com/mpiton/vortex).
 
 ## Requirements
 
-- Vortex plugin host ≥ 0.1.0 with `http_request` and `get_config`
-  host functions enabled.
+- Vortex plugin host ≥ 0.2.0 with `http_request`, `get_config`, and the
+  typed `run_ytdlp` broker enabled.
 
 ## Build
 
@@ -40,7 +40,12 @@ cp target/wasm32-wasip1/release/vortex_mod_vimeo.wasm \
 
 ```bash
 cargo test --target x86_64-unknown-linux-gnu
+
+# The ABI smoke test requires the release WASM artifact.
+cargo build --target wasm32-wasip1 --release
+cargo test --target x86_64-unknown-linux-gnu --test wasm_smoke
 ```
 
 Pure parsing modules (`url_matcher`, `parser`, response builders) are
-covered natively with hardcoded oEmbed and player-config fixtures.
+covered natively with hardcoded oEmbed and player-config fixtures. The smoke
+test loads the release artifact through Extism with local host-function stubs.

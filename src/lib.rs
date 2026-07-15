@@ -245,6 +245,22 @@ pub fn filter_audio_only(mut response: MediaVariantsResponse) -> MediaVariantsRe
     response
 }
 
+/// Resolve a dedicated audio URL, or ask the host to use the adaptive
+/// download fallback when Vimeo only exposes an HLS stream.
+pub fn resolve_audio_only_url(response: MediaVariantsResponse) -> Result<String, PluginError> {
+    let variant = filter_audio_only(response)
+        .variants
+        .into_iter()
+        .next()
+        .ok_or(PluginError::NoVariantsFound)?;
+
+    if matches!(variant.kind, VariantKind::Adaptive) {
+        return Err(PluginError::AdaptiveStreamOnly);
+    }
+
+    Ok(variant.url)
+}
+
 /// Return the variant closest to (but not exceeding) the user's
 /// preferred quality (e.g. `"720p"`). Falls back to the highest
 /// available progressive variant, and finally to the HLS stream.
@@ -412,6 +428,14 @@ mod tests {
         let filtered = filter_audio_only(r);
         assert_eq!(filtered.variants.len(), 1);
         assert_eq!(filtered.variants[0].kind, VariantKind::Adaptive);
+    }
+
+    #[test]
+    fn resolve_audio_only_url_rejects_adaptive_hls() {
+        let variants = build_media_variants_response(sample_config_with_all());
+        let error = resolve_audio_only_url(variants).unwrap_err();
+
+        assert!(matches!(error, PluginError::AdaptiveStreamOnly));
     }
 
     #[test]
