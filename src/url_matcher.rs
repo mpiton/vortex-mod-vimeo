@@ -386,8 +386,7 @@ mod tests {
         // and let arbitrary query junk through. `is_ascii_hexdigit`
         // accepts both cases so we intentionally narrow the predicate.
         assert!(
-            extract_private_hash("https://player.vimeo.com/video/123456789?h=FBA859C46B")
-                .is_none()
+            extract_private_hash("https://player.vimeo.com/video/123456789?h=FBA859C46B").is_none()
         );
     }
 
@@ -423,9 +422,7 @@ mod tests {
             extract_private_hash("https://evil.example.com/123456789/abcdef1234").is_none(),
             "non-Vimeo hosts must not return a hash even with a matching path shape"
         );
-        assert!(
-            extract_private_hash("https://player.example.com/123456789/abcdef1234").is_none()
-        );
+        assert!(extract_private_hash("https://player.example.com/123456789/abcdef1234").is_none());
     }
 
     #[test]
